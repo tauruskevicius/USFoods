@@ -1,0 +1,150 @@
+# Imports
+import matplotlib
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+import sys
+import math
+import numpy
+import statistics
+from matplotlib.pyplot import figure
+import plotly.express as px
+import plotly.io as pio
+from statsmodels.tsa.stattools import grangercausalitytests
+from sklearn.model_selection import TimeSeriesSplit
+import statsmodels as sm
+from sklearn.metrics import mean_squared_error
+import warnings
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.seasonal import STL
+warnings.filterwarnings("ignore")
+sns.set_style('darkgrid')
+
+# Change Directory
+os.chdir(r'C:\Users\tauruskevicius\projects\ia_fcst_capacity\data')
+
+# Read in data
+capacity = pd.read_csv('./Demonstrated Capacity.csv')
+inventory = pd.read_csv('./Inventory.csv')
+sales = pd.read_csv('./Cases Sold.csv')
+mapping = pd.read_csv('./Market Mapping.csv')
+
+# # Cleanup Dataframes
+
+dates = inventory.groupby('FISCAL_YEAR_WEEK')['DATE'].min().reset_index()
+dates['FISCAL_YEAR_WEEK'] = dates['FISCAL_YEAR_WEEK'].astype('int')
+
+# Capacity
+capacity = capacity.rename(columns={'BRNCH_CD':'BRANCH_CODE', 'DATE_EXTRACT':'DATE'})
+capacity = capacity.groupby(['BRANCH_CODE', 'DATE']).agg({'DEMONSTRATED_CASES':'sum'}).reset_index()
+capacity = capacity.merge(inventory[['BRANCH_CODE', 'DATE', 'FISCAL_YEAR_WEEK']],
+                          on = ['BRANCH_CODE', 'DATE'],
+                          how = 'left') # Bring fiscal week
+capacity['FISCAL_YEAR_WEEK'] = capacity['FISCAL_YEAR_WEEK'].ffill() # Fill some NaN
+capacity = capacity.groupby(['BRANCH_CODE', 'FISCAL_YEAR_WEEK']).agg({'DEMONSTRATED_CASES':'max'}).reset_index()
+#capacity['FISCAL_YEAR_WEEK'] = capacity['FISCAL_YEAR_WEEK'].astype(int).astype(str)
+capacity = capacity.merge(dates, how = 'left', on='FISCAL_YEAR_WEEK')
+capacity_max = capacity.groupby(['BRANCH_CODE'])['DEMONSTRATED_CASES'].max().reset_index()
+
+# Inventory
+inventory = inventory.loc[inventory.DATE != '2021-11-25']
+inventory = inventory.groupby(['MARKET', 'BRANCH_CODE', 'FISCAL_YEAR_WEEK']).agg({'CASES_INVENTORY':'max'}).reset_index()
+#inventory = inventory.merge(dates, how = 'left', on='FISCAL_YEAR_WEEK')
+inventory['FISCAL_YEAR_WEEK'] = inventory['FISCAL_YEAR_WEEK'].astype(str)
+
+# Sales
+sales = sales.merge(mapping[['DIV_NBR', 'BRNCH_CD']], on = 'DIV_NBR', how = 'left')
+sales = sales.rename(columns = {'FISC_YR_WK':'FISCAL_YEAR_WEEK', 'BRNCH_CD':'BRANCH_CODE'})
+sales['FISCAL_YEAR_WEEK'] = sales['FISCAL_YEAR_WEEK'].astype(str)
+sales = sales.groupby(['BRANCH_CODE', 'FISCAL_YEAR_WEEK']).agg({'CASES_SOLD':'first'}).reset_index()
+sales = sales.loc[sales.BRANCH_CODE.isin(inventory['BRANCH_CODE'].unique())]
+
+# Inventory
+for branch in inventory['BRANCH_CODE'].unique():
+    figure(figsize=(20, 12))
+    ax = sns.lineplot(x='FISCAL_YEAR_WEEK', y='CASES_INVENTORY', data = inventory.loc[inventory['BRANCH_CODE'] == branch])
+    ax.axhline(capacity_max.loc[capacity_max['BRANCH_CODE'] == branch]['DEMONSTRATED_CASES'].values,
+              linestyle='--', label='Max Capacity', c='red')
+    plt.title('Inventory in {} WareHouse'.format(branch))
+    plt.xlabel('Fiscal Year Week')
+    for label in ax.xaxis.get_ticklabels()[::2]:
+        label.set_visible(False)
+    plt.xticks(rotation=90)
+    plt.ylabel('Cases')
+    plt.legend()
+    plt.show()
+    
+# SALES
+for branch in inventory['BRANCH_CODE'].unique():
+    figure(figsize=(20, 12))
+    ax = sns.lineplot(x='FISCAL_YEAR_WEEK', y='CASES_SOLD', data = sales.loc[sales['BRANCH_CODE'] == branch])
+    plt.title('Sales in {} WareHouse'.format(branch))
+    plt.xlabel('Fiscal Year Week')
+    for label in ax.xaxis.get_ticklabels()[::2]:
+        label.set_visible(False)
+    plt.xticks(rotation=90)
+    plt.ylabel('Cases')
+    # plt.axis('scaled')
+    plt.show()
+    
+# Join tables
+df = inventory.merge(capacity_max, on = ['BRANCH_CODE'], how = 'left')
+df = df.merge(sales, on = ['BRANCH_CODE', 'FISCAL_YEAR_WEEK'], how = 'inner').drop('MARKET', axis = 1)
+df = df.loc[df['FISCAL_YEAR_WEEK'] != '202053']
+df['FISCAL_YEAR_WEEK'] = df['FISCAL_YEAR_WEEK'].astype(int)
+# Bring date back in
+df = df.merge(dates, how = 'left', on = 'FISCAL_YEAR_WEEK')
+
+# Set Index to Date
+df.loc[:,'DATE'] = pd.to_datetime(df['DATE'])
+df.set_index(df.DATE, inplace=True)
+
+# Cross Correlation
+# Sales is lagging in forwards
+# Inventory is lagging in backwards (not of interest)
+numpy.set_printoptions(threshold=sys.maxsize)
+
+for warehouse in inventory['BRANCH_CODE'].unique():
+    forwards = sm.tsa.stattools.ccf(df.loc[df['BRANCH_CODE'] == warehouse]['CASES_INVENTORY'],
+                         df.loc[df['BRANCH_CODE'] == warehouse]['CASES_SOLD'],
+                         adjusted = False)[0:9]
+    backwards = sm.tsa.stattools.ccf(df.loc[df['BRANCH_CODE'] == warehouse]['CASES_SOLD'],
+                     df.loc[df['BRANCH_CODE'] == warehouse]['CASES_INVENTORY'],
+                     adjusted = False)[1:9][::-1]
+    combo = np.r_[backwards, forwards]
+    
+    print(warehouse)
+    ax = sns.lineplot(x=np.arange(-8,9,1), y=combo)
+    plt.show()
+    print('\n\n')
+ 
+# Granger Causality
+for warehouse in df['BRANCH_CODE'].unique():
+    print('Warehouse {}'.format(warehouse))
+    gc_res = grangercausalitytests(df.loc[df['BRANCH_CODE'] == warehouse][['CASES_INVENTORY', 'CASES_SOLD']], 6)
+    
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.seasonal import STL
+
+# Additive Decomposition
+for warehouse in inventory['BRANCH_CODE'].unique():
+    index = inventory.index.astype(int)
+    additive_decomposition = seasonal_decompose(inventory.loc[inventory['BRANCH_CODE'] == warehouse]['CASES_INVENTORY'],
+                                                model='additive', period=52)
+    fig = additive_decomposition.plot().suptitle('Additive Decomposition for Warehouse {}'.format(warehouse), fontsize=16)
+    fig = matplotlib.pyplot.gcf()
+    fig.set_size_inches(18.5, 14.5)
+    #plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    plt.show()
+    print('\n\n\n\n')
+
+for warehouse in inventory['BRANCH_CODE'].unique():
+    fig, ax = plt.subplots(2, figsize=(12,6))
+    ax[0] = plot_acf(df.loc[df['BRANCH_CODE'] == warehouse]['CASES_INVENTORY'], ax=ax[0], lags=20, title='Autocorrelation for warehouse {}'.format(warehouse))
+    ax[1] = plot_pacf(df.loc[df['BRANCH_CODE'] == warehouse]['CASES_INVENTORY'], ax=ax[1], lags=20)
+    
